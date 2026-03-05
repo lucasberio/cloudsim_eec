@@ -28,7 +28,7 @@ machine class:
         GPUs: no
 }
 
-# X86, High energy, has gpu, high performance machines
+# x86, High energy, has gpu, high performance machines
 machine class:
 {
         Number of machines: 4
@@ -42,7 +42,7 @@ machine class:
         GPUs: yes
 }
 
-# ARM, Medium energy, has gpu, hybrid machines
+# ARM, Medium energy, has gpu, funky hybrid machines
 machine class:
 {
         Number of machines: 8
@@ -59,16 +59,15 @@ machine class:
 
 
 
-# Tasks!!!!
+# Task!!!!!
 
-# Task 1: Low-intensity warm-up (X86)
-# Window: 500,000ms | Inter arrival: 50,000ms | ~10 tasks
-# Small WEB requests, SLA2 so the scheduler can relax and consolidate
+# First Task (ARM)
+# A bunch of small requests (WEB), around 20 tasks, SLA2 for chill, small tasks
 task class:
 {
         Start time: 0
         End time: 500000
-        Inter arrival: 50000
+        Inter arrival: 25000
         Expected runtime: 150000
         Memory: 4
         VM type: LINUX
@@ -79,15 +78,14 @@ task class:
         Seed: 12345
 }
 
-# Task 2: Normal baseline (X86)
-# Window: 1,000,000ms | Inter arrival: 20000ms | ~50 tasks
-# Moderate STREAM workload, SLA1 deadlines, gives scheduler breathing room
+# Second Task (x86)
+# Compute intensive tasks, short bursts (STREAM), around 125 tasks, SLA1 for reaching teh deadlines 
 task class:
 {
         Start time: 500000
         End time: 1500000
-        Inter arrival: 20000
-        Expected runtime: 400000
+        Inter arrival: 8000
+        Expected runtime: 600000
         Memory: 8
         VM type: LINUX
         GPU enabled: no
@@ -97,15 +95,15 @@ task class:
         Seed: 100
 }
 
-# Task 3: Normal baseline (ARM)
-# Window: 1,000,000ms | Inter arrival: 25,000ms | ~40 tasks
-# Runs same time as Task 2, SLA3 best-effort, ARM machines absorb these
+# Third Task (ARM)
+# Around the same as task 2 but for ARM, SLA3 to complete whenever however, aronnd 100 tasks
+# Runs at the same time as the x86 Task before
 task class:
 {
         Start time: 500000
         End time: 1500000
-        Inter arrival: 25000
-        Expected runtime: 400000
+        Inter arrival: 10000
+        Expected runtime: 600000
         Memory: 8
         VM type: LINUX
         GPU enabled: no
@@ -115,14 +113,13 @@ task class:
         Seed: 200
 }
 
-# Task 4: Surge — X86 no GPU (CRYPTO)
-# Window: 500,000ms | Inter arrival: 5,000ms | ~100 tasks
-# SLA0 tight deadline, tests scheduler waking machines fast enough
+# Fourth Task (x86)
+# Short, repetitive, high amount of tasks (CRYPTO), uses the GPU, around 500 tasks, SLA0 for asap
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 5000
+        Inter arrival: 1000
         Expected runtime: 300000
         Memory: 8
         VM type: LINUX
@@ -133,14 +130,15 @@ task class:
         Seed: 101
 }
 
-# Task 5: Surge — X86 GPU (AI)
-# Window: 500,000ms | Inter arrival: 8,000ms | ~62 tasks
-# Routes only to 4 X86 GPU machines, SLA0 tight deadline
+
+# Fifth Task (x86)
+# compute intensive, GPU included, (AI), around 167 tasks, SLA0 FINISH ASAP
+# Runs at the same time as Task 4
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 8000
+        Inter arrival: 3000
         Expected runtime: 300000
         Memory: 16
         VM type: LINUX
@@ -151,14 +149,14 @@ task class:
         Seed: 102
 }
 
-# Task 6: Surge — ARM GPU (AI)
-# Window: 500,000ms | Inter arrival: 10,000ms | ~50 tasks
-# Routes to 8 ARM GPU machines, SLA1 slightly relaxed
+# Sixth Task (ARM)
+# Also I task, high computation, around 125 tasks, uses GPU but relaxes for SLA1 for routing 
+# Same time as tasks 4 and 5
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 10000
+        Inter arrival: 4000
         Expected runtime: 300000
         Memory: 16
         VM type: LINUX
@@ -169,15 +167,12 @@ task class:
         Seed: 103
 }
 
-# Task 7: Cooldown
-# Window: 800,000ms | Inter arrival: 50,000ms | ~16 tasks
-# Trickle of WEB tasks, SLA3 best effort
-# Scheduler should sleep idle machines aggressively here
+# Seveth Task (X86)
+# Cooldown web jobs, low-rate SLA3, around 40 tasks, should sleep idle machines
 task class:
 {
-        Start time: 2000000
         End time: 2800000
-        Inter arrival: 50000
+        Inter arrival: 20000
         Expected runtime: 150000
         Memory: 4
         VM type: LINUX
