@@ -1,4 +1,4 @@
-# Machines!!!!
+# === Machines!!!! ===
 
 # X86, High energy, no gpu, high performance machines
 machine class:
@@ -59,7 +59,9 @@ machine class:
 
 
 
-# Task!!!!!
+
+
+# === Tasks!!!!! ===
 
 # First Task (ARM)
 # A bunch of small requests (WEB), around 20 tasks, SLA2 for chill, small tasks
@@ -129,7 +131,6 @@ task class:
         Task type: CRYPTO
         Seed: 101
 }
-
 
 # Fifth Task (x86)
 # compute intensive, GPU included, (AI), around 167 tasks, SLA0 FINISH ASAP
