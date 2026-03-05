@@ -151,7 +151,7 @@ task class:
 }
 
 # Sixth Task (ARM)
-# Also I task, high computation, around 125 tasks, uses GPU but relaxes for SLA1 for routing 
+# Also AI task, high computation, around 125 tasks, uses GPU but relaxes for SLA1 for routing 
 # Same time as tasks 4 and 5
 task class:
 {
@@ -168,7 +168,7 @@ task class:
         Seed: 103
 }
 
-# Seveth Task (X86)
+# Seventh Task (X86)
 # Cooldown web jobs, low-rate SLA3, around 40 tasks, should sleep idle machines
 task class:
 {
