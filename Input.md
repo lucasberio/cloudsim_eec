@@ -59,11 +59,9 @@ machine class:
 
 
 
-
-
 # === Tasks!!!!! ===
 
-# First Task (ARM)
+# First Task (X86)
 # A bunch of small requests (WEB), around 20 tasks, SLA2 for chill, small tasks
 task class:
 {
@@ -80,8 +78,8 @@ task class:
         Seed: 12345
 }
 
-# Second Task (x86)
-# Compute intensive tasks, short bursts (STREAM), around 125 tasks, SLA1 for reaching teh deadlines 
+# Second Task (X86)
+# Compute intensive tasks, short bursts (STREAM), around 125 tasks, SLA1 for reaching the deadlines
 task class:
 {
         Start time: 500000
@@ -98,7 +96,7 @@ task class:
 }
 
 # Third Task (ARM)
-# Around the same as task 2 but for ARM, SLA3 to complete whenever however, aronnd 100 tasks
+# Around the same as task 2 but for ARM, SLA3 to complete whenever however, around 100 tasks
 # Runs at the same time as the x86 Task before
 task class:
 {
@@ -115,13 +113,14 @@ task class:
         Seed: 200
 }
 
-# Fourth Task (x86)
-# Short, repetitive, high amount of tasks (CRYPTO), uses the GPU, around 500 tasks, SLA0 for asap
+# Fourth Task (X86)
+# Short, repetitive, high amount of tasks (CRYPTO), no GPU, around 100 tasks, SLA0 for asap
+# Inter arrival scaled to 5000 to prevent overloading the scheduler
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 1000
+        Inter arrival: 5000
         Expected runtime: 300000
         Memory: 8
         VM type: LINUX
@@ -132,14 +131,14 @@ task class:
         Seed: 101
 }
 
-# Fifth Task (x86)
-# compute intensive, GPU included, (AI), around 167 tasks, SLA0 FINISH ASAP
+# Fifth Task (X86)
+# Compute intensive, GPU included (AI), around 62 tasks, SLA0 FINISH ASAP
 # Runs at the same time as Task 4
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 3000
+        Inter arrival: 8000
         Expected runtime: 300000
         Memory: 16
         VM type: LINUX
@@ -151,13 +150,13 @@ task class:
 }
 
 # Sixth Task (ARM)
-# Also AI task, high computation, around 125 tasks, uses GPU but relaxes for SLA1 for routing 
+# Also AI task, high computation, around 50 tasks, uses GPU but relaxes for SLA1 for routing
 # Same time as tasks 4 and 5
 task class:
 {
         Start time: 1500000
         End time: 2000000
-        Inter arrival: 4000
+        Inter arrival: 10000
         Expected runtime: 300000
         Memory: 16
         VM type: LINUX
@@ -172,6 +171,7 @@ task class:
 # Cooldown web jobs, low-rate SLA3, around 40 tasks, should sleep idle machines
 task class:
 {
+        Start time: 2000000
         End time: 2800000
         Inter arrival: 20000
         Expected runtime: 150000
