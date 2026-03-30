@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include "Scheduler.hpp"
+#include <deque>
 
 // 4 types of algorithms, choose here
 typedef enum { ROUND_ROBIN, GREEDY, PMAPPER, EECO } AlgorithmType;
@@ -19,8 +20,97 @@ static bool migrating = false;
 static std::unordered_map<VMId_t, bool> vm_migrating;       // Track which VMs are currently migrating
 static std::unordered_map<MachineId_t, vector<VMId_t>> machine_vms; // list of VMs on machines
 static std::unordered_map<MachineId_t, bool> machine_waking; // machines waking up
+static std::deque<TaskId_t> pending_tasks;
+static std::unordered_map<MachineId_t, Time_t> machine_idle_since;
 
 // Helper Methods!
+
+VMId_t FindReusableVM(MachineId_t machine, TaskId_t task_id) {
+    VMType_t required_vm   = RequiredVMType(task_id);
+    CPUType_t required_cpu = RequiredCPUType(task_id);
+
+    for(VMId_t vm : machine_vms[machine]) {
+        if(vm_migrating[vm]) continue;
+        VMInfo_t vminfo = VM_GetInfo(vm);
+        if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
+            return vm;
+        }
+    }
+    return VMId_t(-1);
+}
+
+bool TryPlaceTaskNow_PMapper(TaskId_t task_id) {
+    VMType_t   required_vm  = RequiredVMType(task_id);
+    CPUType_t  required_cpu = RequiredCPUType(task_id);
+    SLAType_t  required_sla = RequiredSLA(task_id);
+    Priority_t priority     = SLAToPriority(required_sla);
+
+    MachineId_t best_machine = MachineId_t(-1);
+    int best_score = -1;
+
+    // Prefer already-awake machines, and pack onto the most loaded one
+    // that still has room. This is the core pMapper idea.
+    for(unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t machine = MachineId_t(i);
+        MachineInfo_t info = Machine_GetInfo(machine);
+
+        if(info.s_state != S0) continue;
+        if(info.cpu != required_cpu) continue;
+        if(!MachineHasMemory(machine, task_id)) continue;
+        if(info.active_tasks >= info.num_cpus * 2) continue;
+
+        int score = (int)info.active_tasks;
+        if(score > best_score) {
+            best_score = score;
+            best_machine = machine;
+        }
+    }
+
+    if(best_machine != MachineId_t(-1)) {
+        VMId_t vm = FindReusableVM(best_machine, task_id);
+        if(vm == VMId_t(-1)) {
+            vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(vm, best_machine);
+            vms.push_back(vm);
+            machine_vms[best_machine].push_back(vm);
+            vm_migrating[vm] = false;
+        }
+        VM_AddTask(vm, task_id, priority);
+        machine_idle_since[best_machine] = 0;
+        return true;
+    }
+
+    // If no awake machine works, wake one matching sleeping machine
+    for(unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t machine = MachineId_t(i);
+        MachineInfo_t info = Machine_GetInfo(machine);
+
+        if(info.cpu != required_cpu) continue;
+        if(info.s_state == S0) continue;
+        if(machine_waking[machine]) continue;
+
+        Machine_SetState(machine, S0);
+        machine_waking[machine] = true;
+        pending_tasks.push_back(task_id);
+        return true;
+    }
+
+    return false;
+}
+
+void RetryPendingTasks_PMapper() {
+    size_t count = pending_tasks.size();
+    for(size_t i = 0; i < count; i++) {
+        TaskId_t task = pending_tasks.front();
+        pending_tasks.pop_front();
+
+        if(IsTaskCompleted(task)) continue;
+
+        if(!TryPlaceTaskNow_PMapper(task)) {
+            pending_tasks.push_back(task);
+        }
+    }
+}
 
 // priority helper method to clear up the code a bit
 Priority_t SLAToPriority(SLAType_t sla) {
@@ -164,7 +254,15 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         VM_AddTask(target_vm, task_id, priority);
     }
 
-    // pMapper and EECO
+    // pMapper
+    if(CURRENT_ALGO == PMAPPER) {
+        if(!TryPlaceTaskNow_PMapper(task_id)) {
+            SimOutput("pMapper: failed to place task " + to_string(task_id), 1);
+        }
+        return;
+    }
+
+    // eeco
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -173,6 +271,30 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     // Sleep logic will be implemented in pMapper
+
+    if(CURRENT_ALGO != PMAPPER) return;
+
+    RetryPendingTasks_PMapper();
+
+    for(unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t m = MachineId_t(i);
+        MachineInfo_t info = Machine_GetInfo(m);
+
+        if(info.s_state != S0) continue;
+
+        if(info.active_tasks == 0) {
+            if(machine_idle_since[m] == 0) {
+                machine_idle_since[m] = now;
+            }
+
+            // Sleep idle machines after a little while
+            if(now - machine_idle_since[m] > 200000) {
+                Machine_SetState(m, S3);
+            }
+        } else {
+            machine_idle_since[m] = 0;
+        }
+    }
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -192,8 +314,14 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
     // Sleep logic is handled in PeriodicCheck
+
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id)
               + " is complete at " + to_string(now), 4);
+
+    if(CURRENT_ALGO == PMAPPER) {
+        RetryPendingTasks_PMapper();
+    }
+
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -263,5 +391,8 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     MachineInfo_t info = Machine_GetInfo(machine_id);
     if(info.s_state == S0) {
         machine_waking[machine_id] = false;
+        if(CURRENT_ALGO == PMAPPER) {
+            RetryPendingTasks_PMapper();
+        }
     }
 }
