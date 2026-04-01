@@ -12,7 +12,7 @@
 
 // 4 types of algorithms, choose here
 typedef enum { ROUND_ROBIN, GREEDY, MINMIN, EECO } AlgorithmType;
-static AlgorithmType CURRENT_ALGO = MINMIN;
+static AlgorithmType CURRENT_ALGO = EECO;
 
 // shared state for all algorithms
 static unsigned rr_counter = 0;
@@ -42,13 +42,6 @@ bool MachineHasMemory(MachineId_t machine_id, TaskId_t task_id) {
     unsigned free_memory  = current_machine.memory_size - current_machine.memory_used;
     unsigned memory_needed    = GetTaskMemory(task_id) + 8; // 8MB VM overhead (seems to be large average)
     return (free_memory >= memory_needed);
-}
-
-// sort pending tasks by SLA urgency so high priority tasks get placed first
-void SortPendingBySLA() {
-    sort(pending_tasks.begin(), pending_tasks.end(), [](TaskId_t a, TaskId_t b) {
-        return RequiredSLA(a) < RequiredSLA(b); // SLA0=0 is most urgent
-    });
 }
 
 // The Scheduler!
@@ -142,135 +135,345 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     }
 
     // Greedy Algorithm
-	if(CURRENT_ALGO == GREEDY) {
-		MachineId_t best_machine = MachineId_t(-1);
-		unsigned best_score = 0;
-		bool task_wants_gpu = IsTaskGPUCapable(task_id);
+    if(CURRENT_ALGO == GREEDY) {
+        MachineId_t best_machine = MachineId_t(-1);
+        unsigned best_score = 0;
+        bool task_wants_gpu = IsTaskGPUCapable(task_id);
 
-		for(unsigned i = 0; i < total; i++) { //loop through all the machines, find machines for tasks
-			MachineId_t machine = MachineId_t(i);
-			MachineInfo_t info  = Machine_GetInfo(machine);
-			if(info.s_state != S0 || info.cpu != required_cpu
-				|| !MachineHasMemory(machine, task_id)) {
-				continue;
-			}
+        for(unsigned i = 0; i < total; i++) { //loop through all the machines, find machines for tasks
+            MachineId_t machine = MachineId_t(i);
+            MachineInfo_t info  = Machine_GetInfo(machine);
+            if(info.s_state != S0 || info.cpu != required_cpu
+                || !MachineHasMemory(machine, task_id)) {
+                continue;
+            }
 
-			// never exceed the number of cores — this is the hard limit
-			if(info.active_tasks >= info.num_cpus) continue;
+            // never exceed the number of cores — this is the hard limit
+            if(info.active_tasks >= info.num_cpus) continue;
 
-			// we need a way to prefer gpu machines for gpu tasks
-			// lets use a scoring system, add a bonus score to the gpu machines
-			unsigned score = info.memory_used;
-			if(task_wants_gpu && info.gpus) score += 1000000; // GPU bonus score
-			if(score >= best_score) {
-				best_score = score;
-				best_machine = machine;
-			}
-		}
+            // we need a way to prefer gpu machines for gpu tasks
+            // lets use a scoring system, add a bonus score to the gpu machines
+            unsigned score = info.memory_used;
+            if(task_wants_gpu && info.gpus) score += 1000000; // GPU bonus score
+            if(score >= best_score) {
+                best_score   = score;
+                best_machine = machine;
+            }
+        }
 
-		//if we still didnt find a machine, queue it for later when memory frees up
-		if(best_machine == MachineId_t(-1)) {
-			SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
-					+ to_string(task_id), 1);
-			pending_tasks.push_back(task_id);
-			return;
-		}
+        //if we still didnt find a machine, queue it for later when memory frees up
+        if(best_machine == MachineId_t(-1)) {
+            SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
+                    + to_string(task_id), 1);
+            pending_tasks.push_back(task_id);
+            return;
+        }
 
-		//now that we have machines for tasks, allocate VMs
-		VMId_t target_vm = VMId_t(-1);
-		for(VMId_t vm : machine_vms[best_machine]) {
-			VMInfo_t vminfo = VM_GetInfo(vm);
-			if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
-				target_vm = vm;
-				break;
-			}
-		}
-		// if no VMs exist, make one!
-		if(target_vm == VMId_t(-1)) {
-			target_vm = VM_Create(required_vm, required_cpu);
-			VM_Attach(target_vm, best_machine);
-			vms.push_back(target_vm);
-			machine_vms[best_machine].push_back(target_vm);
-		}
-		VM_AddTask(target_vm, task_id, priority); // add the task to the VM
-		task_placed[task_id] = true;
-	}
-	// Min-Min Algorithm
-	if(CURRENT_ALGO == MINMIN) {
-		// in this algorithm, we estimate completion time for all tasks, 
-		// pick the task-machine pairs with the lowest completion time, 
-		// repeat until all tasks are completed!
-		MachineId_t best_machine = MachineId_t(-1);
-		double best_completion = __DBL_MAX__; // start with worst possible time
-		bool task_wants_gpu = IsTaskGPUCapable(task_id);
-		TaskInfo_t task_info = GetTaskInfo(task_id);
-		for(unsigned i = 0; i < total; i++) {
-			MachineId_t machine = MachineId_t(i);
-			MachineInfo_t info  = Machine_GetInfo(machine);
-			if(info.s_state != S0 || info.cpu != required_cpu
-				|| !MachineHasMemory(machine, task_id)) {
-				continue;
-			} // once again, checking all machines if they are alive
-			if(info.active_tasks >= info.num_cpus){
-				continue; // just in case, make sure the tasks dont exceed hardware available
-			} 
+        //now that we have machines for tasks, allocate VMs
+        VMId_t target_vm = VMId_t(-1);
+        for(VMId_t vm : machine_vms[best_machine]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
+                target_vm = vm;
+                break;
+            }
+        }
+        // if no VMs exist, make one!
+        if(target_vm == VMId_t(-1)) {
+            target_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(target_vm, best_machine);
+            vms.push_back(target_vm);
+            machine_vms[best_machine].push_back(target_vm);
+        }
+        VM_AddTask(target_vm, task_id, priority); // add the task to the VM
+        task_placed[task_id] = true;
+    }
 
-			// MATH TIME!
-			// Set up the estimation time of each task!
-			// estimated completion = instructions / (mips adjusted for contention)
-			double mips = (double)info.performance[info.p_state]; //processor state in mips
-			if(task_wants_gpu && info.gpus) mips *= 2.0; // GPU gives significant boost per docs
-			// contention is the slowdown of tasks being shared, we need this so that we dont spam powerful machines
-			double contention = (info.active_tasks > 0) ? (double)info.active_tasks : 1.0;
-			double estimated_completion = (double)task_info.total_instructions / (mips / contention);
+    // Min-Min Algorithm
+    // For each incoming task, estimate how fast each machine can finish it
+    // estimated completion time = task instructions / machine MIPS adjusted for contention
+    // pick the machine with the minimum estimated completion time
+    if(CURRENT_ALGO == MINMIN) {
+        MachineId_t best_machine = MachineId_t(-1);
+        double best_ect          = 1e18; // start with worst possible time
+        bool task_wants_gpu      = IsTaskGPUCapable(task_id);
+        unsigned expected_runtime = GetTaskInfo(task_id).target_completion; // in microseconds
 
-			// pick the machine with the lowest estimated completion time (cool cool)
-			if(estimated_completion < best_completion) {
-				best_completion = estimated_completion;
-				best_machine = machine;
-			}
-		}
+        for(unsigned i = 0; i < total; i++) {
+            MachineId_t machine = MachineId_t(i);
+            MachineInfo_t info  = Machine_GetInfo(machine);
 
-		// if we still didnt find a machine, queue it for later when memory frees up
-		if(best_machine == MachineId_t(-1)) {
-			SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
-					+ to_string(task_id), 1);
-			pending_tasks.push_back(task_id);
-			return;
-		}
+            if(info.s_state != S0 || info.cpu != required_cpu
+                || !MachineHasMemory(machine, task_id)) {
+                continue;
+            } // once again, checking all machines if they are alive
+            if(info.active_tasks >= info.num_cpus) {
+                continue; // just in case, make sure the tasks dont exceed hardware available
+            }
+            // gpu tasks prefer gpu machines
+            if(task_wants_gpu && !info.gpus) continue;
 
-		// repeat of greedy algorithm for vm use
-		// now that we have machines for tasks, allocate VMs
-		VMId_t target_vm = VMId_t(-1);
-		for(VMId_t vm : machine_vms[best_machine]) {
-			VMInfo_t vminfo = VM_GetInfo(vm);
-			if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
-				target_vm = vm;
-				break;
-			}
-		}
-		// if no VMs exist, make one!
-		if(target_vm == VMId_t(-1)) {
-			target_vm = VM_Create(required_vm, required_cpu);
-			VM_Attach(target_vm, best_machine);
-			vms.push_back(target_vm);
-			machine_vms[best_machine].push_back(target_vm);
-		}
-		VM_AddTask(target_vm, task_id, priority); // add the task to the VM
-		task_placed[task_id] = true;
-	}
+            // MATH TIME!
+            // ECT = (1 + load_factor) * expected_runtime / (mips / 1000)
+            // load_factor accounts for contention — more tasks = slower per task
+            double mips        = (double)info.performance[0]; // P0 MIPS — fastest speed
+            double load_factor = (double)info.active_tasks / (double)info.num_cpus;
+            double ect         = (1.0 + load_factor) * (double)expected_runtime / (mips / 1000.0);
 
-	// E-ECO
-		
+            // pick the machine with the lowest estimated completion time (cool cool)
+            if(ect < best_ect) {
+                best_ect     = ect;
+                best_machine = machine;
+            }
+        }
+
+        // if no S0 machine found, try to wake a sleeping one and queue the task
+        if(best_machine == MachineId_t(-1)) {
+            for(unsigned i = 0; i < total; i++) {
+                MachineId_t machine = MachineId_t(i);
+                MachineInfo_t info  = Machine_GetInfo(machine);
+                if(info.cpu != required_cpu) continue;
+                if(task_wants_gpu && !info.gpus) continue;
+                if(machine_waking[machine]) continue; // already waking, just queue
+                if(info.s_state != S0) {
+                    Machine_SetState(machine, S0);
+                    machine_waking[machine] = true;
+                    SimOutput("Scheduler::NewTask(MINMIN): Waking machine "
+                              + to_string(machine) + " for task " + to_string(task_id), 2);
+                    break;
+                }
+            }
+            SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
+                    + to_string(task_id), 1);
+            pending_tasks.push_back(task_id);
+            return;
+        }
+
+        // repeat of greedy algorithm for vm use
+        // now that we have machines for tasks, allocate VMs
+        VMId_t target_vm = VMId_t(-1);
+        for(VMId_t vm : machine_vms[best_machine]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
+                target_vm = vm;
+                break;
+            }
+        }
+        // if no VMs exist, make one!
+        if(target_vm == VMId_t(-1)) {
+            target_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(target_vm, best_machine);
+            vms.push_back(target_vm);
+            machine_vms[best_machine].push_back(target_vm);
+        }
+        VM_AddTask(target_vm, task_id, priority); // add the task to the VM
+        task_placed[task_id] = true;
+    }
+
+    // E-ECO Algorithm
+    // consolidate onto fewest machines, throttle cores with P-states,
+    // sleep idle machines, wake a machine only as the last resort
+    if(CURRENT_ALGO == EECO) {
+        bool task_wants_gpu = IsTaskGPUCapable(task_id);
+
+        // find the most-loaded ON machine that still fits
+        MachineId_t best_machine = MachineId_t(-1);
+        unsigned best_score      = 0;
+
+        for(unsigned i = 0; i < total; i++) {
+            MachineId_t machine = MachineId_t(i);
+            MachineInfo_t info  = Machine_GetInfo(machine);
+
+            if(info.s_state != S0) continue;
+            if(info.cpu != required_cpu) continue;
+            if(!MachineHasMemory(machine, task_id)) continue;
+            if(info.active_tasks >= info.num_cpus) continue;
+
+            // GPU tasks MUST go to a GPU machine
+            if(task_wants_gpu && !info.gpus) continue;
+
+            // Score = active_tasks (prefer busiest so idle machines can actually sleep)
+            unsigned score = info.active_tasks + 1;
+            if(task_wants_gpu && info.gpus) score += 500; // favor to the gpu
+            if(score > best_score) {
+                best_score   = score;
+                best_machine = machine;
+            }
+        }
+
+        // if nothing found, try to wake a sleeping machine
+        if(best_machine == MachineId_t(-1)) {
+            for(unsigned i = 0; i < total; i++) {
+                MachineId_t machine = MachineId_t(i);
+                MachineInfo_t info  = Machine_GetInfo(machine);
+                if(info.cpu != required_cpu) continue;
+                if(task_wants_gpu && !info.gpus) continue;
+                // pick a machine that is off or in a low S-state and not already waking
+                if((info.s_state != S0) && !machine_waking[machine]) {
+                    Machine_SetState(machine, S0);
+                    machine_waking[machine] = true;
+                    SimOutput("Scheduler::NewTask(EECO): Waking machine "
+                              + to_string(machine) + " for task " + to_string(task_id), 2);
+                    // queue the task, StateChangeComplete then PeriodicCheck will place it
+                    pending_tasks.push_back(task_id);
+                    return;
+                }
+                // machine is already waking so just queue, it'll be placed when up
+                if(machine_waking[machine]) {
+                    pending_tasks.push_back(task_id);
+                    return;
+                }
+            }
+            // truly no machine of the right type exists, queue and hope lol
+            SimOutput("Scheduler::NewTask(EECO): No machine available, queuing task "
+                      + to_string(task_id), 1);
+            pending_tasks.push_back(task_id);
+            return;
+        }
+
+        // allocate / reuse a VM on best_machine
+        VMId_t target_vm = VMId_t(-1);
+        for(VMId_t vm : machine_vms[best_machine]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
+                target_vm = vm;
+                break;
+            }
+        }
+        // if no VMs exist, make one!
+        if(target_vm == VMId_t(-1)) {
+            target_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(target_vm, best_machine);
+            vms.push_back(target_vm);
+            machine_vms[best_machine].push_back(target_vm);
+        }
+        VM_AddTask(target_vm, task_id, priority); // add the task to the VM
+        task_placed[task_id] = true;
+
+        // set all cores on the machine to the right P-state given the current load
+        MachineInfo_t info = Machine_GetInfo(best_machine);
+        float util = (float)(info.active_tasks + 1) / (float)info.num_cpus;
+        CPUPerformance_t pstate;
+        if(util > 0.75f)       pstate = P0; // full speed
+        else if(util > 0.5f)   pstate = P1;
+        else if(util > 0.25f)  pstate = P2;
+        else                   pstate = P3; // minimum power
+        for(unsigned c = 0; c < info.num_cpus; c++)
+            Machine_SetCorePerformance(best_machine, c, pstate);
+    }
 }
-
 
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
-    // Sleep logic will be implemented in Min-Min
+
+    // only MINMIN and EECO use periodic check for sleep/wake management
+    if(CURRENT_ALGO != MINMIN && CURRENT_ALGO != EECO) return;
+
+    unsigned total = Machine_GetTotal();
+
+    // drain the pending queue using the appropriate algorithm
+    vector<TaskId_t> still_pending;
+    for(TaskId_t pending_id : pending_tasks) {
+        if(task_placed[pending_id]) continue;
+
+        VMType_t   req_vm  = RequiredVMType(pending_id);
+        CPUType_t  req_cpu = RequiredCPUType(pending_id);
+        Priority_t pri     = SLAToPriority(RequiredSLA(pending_id));
+        bool wants_gpu     = IsTaskGPUCapable(pending_id);
+        unsigned exp_rt    = GetTaskInfo(pending_id).target_completion;
+
+        MachineId_t best = MachineId_t(-1);
+
+        if(CURRENT_ALGO == MINMIN) {
+            // use ECT estimation to pick the best machine for pending tasks
+            double best_ect = 1e18;
+            for(unsigned i = 0; i < total; i++) {
+                MachineId_t machine = MachineId_t(i);
+                MachineInfo_t info  = Machine_GetInfo(machine);
+                if(info.s_state != S0 || info.cpu != req_cpu) continue;
+                if(!MachineHasMemory(machine, pending_id)) continue;
+                if(info.active_tasks >= info.num_cpus) continue;
+                if(wants_gpu && !info.gpus) continue;
+                double mips        = (double)info.performance[0];
+                double load_factor = (double)info.active_tasks / (double)info.num_cpus;
+                double ect         = (1.0 + load_factor) * (double)exp_rt / (mips / 1000.0);
+                if(ect < best_ect) { best_ect = ect; best = machine; }
+            }
+        } else { // EECO — consolidation based drain
+            unsigned best_score = 0;
+            for(unsigned i = 0; i < total; i++) {
+                MachineId_t machine = MachineId_t(i);
+                MachineInfo_t info  = Machine_GetInfo(machine);
+                if(info.s_state != S0 || info.cpu != req_cpu) continue;
+                if(!MachineHasMemory(machine, pending_id)) continue;
+                if(info.active_tasks >= info.num_cpus) continue;
+                if(wants_gpu && !info.gpus) continue;
+                unsigned score = info.active_tasks + 1;
+                if(score > best_score) { best_score = score; best = machine; }
+            }
+        }
+
+        if(best == MachineId_t(-1)) {
+            still_pending.push_back(pending_id); // still no room, keep waiting
+            continue;
+        }
+
+        VMId_t target_vm = VMId_t(-1);
+        for(VMId_t vm : machine_vms[best]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            if(vminfo.vm_type == req_vm && vminfo.cpu == req_cpu) {
+                target_vm = vm;
+                break;
+            }
+        }
+        // if no VMs exist, make one!
+        if(target_vm == VMId_t(-1)) {
+            target_vm = VM_Create(req_vm, req_cpu);
+            VM_Attach(target_vm, best);
+            vms.push_back(target_vm);
+            machine_vms[best].push_back(target_vm);
+        }
+        VM_AddTask(target_vm, pending_id, pri);
+        task_placed[pending_id] = true;
+        SimOutput("Scheduler::PeriodicCheck(): Placed pending task " + to_string(pending_id), 2);
+    }
+    pending_tasks = still_pending;
+
+    // sleep idle machines to save energy (both MINMIN and EECO)
+    for(unsigned i = 0; i < total; i++) {
+        MachineId_t machine = MachineId_t(i);
+        MachineInfo_t info  = Machine_GetInfo(machine);
+        if(info.s_state != S0 || machine_waking[machine]) continue;
+        if(info.active_tasks > 0) continue;
+        // check if any VM on this machine still has tasks
+        bool has_work = false;
+        for(VMId_t vm : machine_vms[machine]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            if(!vminfo.active_tasks.empty()) { has_work = true; break; }
+        }
+        if(!has_work) {
+            SimOutput("Scheduler::PeriodicCheck(): Sleeping idle machine " + to_string(machine), 2);
+            Machine_SetState(machine, S5);
+        }
+    }
+
+    // EECO P-state tuning — adjust core speeds based on current utilization
+    if(CURRENT_ALGO == EECO) {
+        for(unsigned i = 0; i < total; i++) {
+            MachineId_t machine = MachineId_t(i);
+            MachineInfo_t info  = Machine_GetInfo(machine);
+            if(info.s_state != S0 || machine_waking[machine] || info.active_tasks == 0) continue;
+            float util = (float)info.active_tasks / (float)info.num_cpus;
+            CPUPerformance_t pstate = (util > 0.75f) ? P0 :
+                                      (util > 0.5f)  ? P1 :
+                                      (util > 0.25f) ? P2 : P3;
+            for(unsigned c = 0; c < info.num_cpus; c++)
+                Machine_SetCorePerformance(machine, c, pstate);
+        }
+    }
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -419,6 +622,28 @@ void SimulationComplete(Time_t time) {
 void SLAWarning(Time_t time, TaskId_t task_id) {
     // boost priority of tasks close to their deadline so they get CPU time faster
     SetTaskPriority(task_id, HIGH_PRIORITY);
+
+    // for MINMIN and EECO, also crank the machine running this task to P0
+    if(CURRENT_ALGO != MINMIN && CURRENT_ALGO != EECO) return;
+    unsigned total = Machine_GetTotal();
+    for(unsigned i = 0; i < total; i++) {
+        MachineId_t machine = MachineId_t(i);
+        MachineInfo_t minfo = Machine_GetInfo(machine);
+        if(minfo.s_state != S0) continue;
+        for(VMId_t vm : machine_vms[machine]) {
+            VMInfo_t vminfo = VM_GetInfo(vm);
+            for(TaskId_t t : vminfo.active_tasks) {
+                if(t == task_id) {
+                    // crank all cores to P0 so this task finishes faster
+                    for(unsigned c = 0; c < minfo.num_cpus; c++)
+                        Machine_SetCorePerformance(machine, c, P0);
+                    SimOutput("SLAWarning(): Boosted machine " + to_string(machine)
+                              + " to P0 for task " + to_string(task_id), 2);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
