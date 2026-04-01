@@ -36,7 +36,7 @@ Priority_t SLAToPriority(SLAType_t sla) {
     }
 }
 
-// holy chat
+// holy chat!
 bool MachineHasMemory(MachineId_t machine_id, TaskId_t task_id) {
     MachineInfo_t current_machine = Machine_GetInfo(machine_id);
     unsigned free_memory  = current_machine.memory_size - current_machine.memory_used;
