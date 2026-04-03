@@ -12,7 +12,7 @@
 
 // 4 types of algorithms, choose here
 typedef enum { ROUND_ROBIN, GREEDY, MINMIN, EECO } AlgorithmType;
-static AlgorithmType CURRENT_ALGO = EECO;
+static AlgorithmType CURRENT_ALGO = MINMIN;
 
 // shared state for all algorithms
 static unsigned rr_counter = 0;
