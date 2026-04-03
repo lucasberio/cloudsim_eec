@@ -12,7 +12,7 @@
 
 // 4 types of algorithms, choose here
 typedef enum { ROUND_ROBIN, GREEDY, MINMIN, EECO } AlgorithmType;
-static AlgorithmType CURRENT_ALGO = ROUND_ROBIN;
+static AlgorithmType CURRENT_ALGO = MINMIN;
 
 // shared state for all algorithms
 static unsigned rr_counter = 0;
@@ -60,7 +60,6 @@ bool MachineHasMemory(MachineId_t machine_id, TaskId_t task_id) {
     
     return (free_memory >= total_needed);
 }
-
 
 //testing
 // ==================== ADD THIS AT TOP (after globals) ====================
@@ -152,6 +151,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     if(CURRENT_ALGO == GREEDY) {
         MachineId_t best_machine = MachineId_t(-1);
         unsigned best_score = 0;
+        unsigned best_perf = 0;
         bool task_wants_gpu = IsTaskGPUCapable(task_id);
 
         for(unsigned i = 0; i < total; i++) {
@@ -166,8 +166,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
             unsigned score = info.memory_used;
             if(task_wants_gpu && info.gpus) score += 1000000;
-            if(score >= best_score) {
-                best_score   = score;
+
+            unsigned perf = info.performance[0];
+
+            if(best_machine == MachineId_t(-1) ||
+               score > best_score ||
+               (score == best_score && perf > best_perf)) {
+                best_score = score;
+                best_perf = perf;
                 best_machine = machine;
             }
         }
@@ -462,6 +468,43 @@ void Scheduler::PeriodicCheck(Time_t now) {
         }
 
         if(best == MachineId_t(-1)) {
+            if(CURRENT_ALGO == MINMIN) {
+                for(unsigned i = 0; i < total; i++) {
+                    MachineId_t machine = MachineId_t(i);
+                    MachineInfo_t info  = Machine_GetInfo(machine);
+
+                    if(info.cpu != req_cpu) continue;
+                    if(wants_gpu && !info.gpus) continue;
+                    if(machine_waking[machine]) continue;
+
+                    if(info.s_state != S0) {
+                        Machine_SetState(machine, S0);
+                        machine_waking[machine] = true;
+                        SimOutput("Scheduler::PeriodicCheck(MINMIN): Waking machine "
+                                  + to_string(machine) + " for pending task "
+                                  + to_string(pending_id), 2);
+                        break;
+                    }
+                }
+            }
+
+            if(CURRENT_ALGO == EECO) {
+                for(unsigned i = 0; i < total; i++) {
+                    MachineId_t machine = MachineId_t(i);
+                    MachineInfo_t info  = Machine_GetInfo(machine);
+                    if(info.cpu != req_cpu) continue;
+                    if(wants_gpu && !info.gpus) continue;
+                    if((info.s_state != S0) && !machine_waking[machine]) {
+                        Machine_SetState(machine, S0);
+                        machine_waking[machine] = true;
+                        SimOutput("Scheduler::PeriodicCheck(EECO): Waking machine "
+                                  + to_string(machine) + " for pending task "
+                                  + to_string(pending_id), 2);
+                        break;
+                    }
+                }
+            }
+
             still_pending.push_back(pending_id);
             continue;
         }
@@ -486,20 +529,24 @@ void Scheduler::PeriodicCheck(Time_t now) {
     }
     pending_tasks = still_pending;
 
-    // sleep idle machines to save energy (both MINMIN and EECO)
-    for(unsigned i = 0; i < total; i++) {
-        MachineId_t machine = MachineId_t(i);
-        MachineInfo_t info  = Machine_GetInfo(machine);
-        if(info.s_state != S0 || machine_waking[machine]) continue;
-        if(info.active_tasks > 0) continue;
-        bool has_work = false;
-        for(VMId_t vm : machine_vms[machine]) {
-            VMInfo_t vminfo = VM_GetInfo(vm);
-            if(!vminfo.active_tasks.empty()) { has_work = true; break; }
-        }
-        if(!has_work) {
-            SimOutput("Scheduler::PeriodicCheck(): Sleeping idle machine " + to_string(machine), 2);
-            Machine_SetState(machine, S5);
+    // sleep idle machines to save energy (EECO only)
+    if(CURRENT_ALGO == EECO && pending_tasks.empty()) {
+        for(unsigned i = 0; i < total; i++) {
+            MachineId_t machine = MachineId_t(i);
+            MachineInfo_t info  = Machine_GetInfo(machine);
+            if(info.s_state != S0 || machine_waking[machine]) continue;
+            if(info.active_tasks > 0) continue;
+
+            bool has_work = false;
+            for(VMId_t vm : machine_vms[machine]) {
+                VMInfo_t vminfo = VM_GetInfo(vm);
+                if(!vminfo.active_tasks.empty()) { has_work = true; break; }
+            }
+
+            if(!has_work) {
+                SimOutput("Scheduler::PeriodicCheck(): Sleeping idle machine " + to_string(machine), 2);
+                Machine_SetState(machine, S5);
+            }
         }
     }
 
@@ -520,9 +567,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    for(auto & vm: vms) {
-        VM_Shutdown(vm);
-    }
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
@@ -532,6 +576,10 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id)
               + " is complete at " + to_string(now), 4);
+
+    if(CURRENT_ALGO == MINMIN || CURRENT_ALGO == EECO) {
+        return;
+    }
 
     sort(pending_tasks.begin(), pending_tasks.end(), [](TaskId_t a, TaskId_t b) {
         return RequiredSLA(a) < RequiredSLA(b);
