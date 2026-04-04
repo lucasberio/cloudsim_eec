@@ -25,7 +25,6 @@ static std::unordered_map<TaskId_t, bool> task_placed; // track if task has been
 
 // Helper Methods!
 
-// priority helper method to clear up the code a bit
 Priority_t SLAToPriority(SLAType_t sla) {
     switch(sla) {
         case SLA0: return HIGH_PRIORITY;
@@ -36,12 +35,10 @@ Priority_t SLAToPriority(SLAType_t sla) {
     }
 }
 
-// Improved memory checking that accounts for VM overhead
 bool MachineHasMemory(MachineId_t machine_id, TaskId_t task_id) {
     MachineInfo_t current_machine = Machine_GetInfo(machine_id);
     unsigned free_memory  = current_machine.memory_size - current_machine.memory_used;
     
-    // Check if we need a new VM for this task
     VMType_t required_vm = RequiredVMType(task_id);
     CPUType_t required_cpu = RequiredCPUType(task_id);
     bool need_new_vm = true;
@@ -55,14 +52,63 @@ bool MachineHasMemory(MachineId_t machine_id, TaskId_t task_id) {
     }
     
     unsigned task_memory = GetTaskMemory(task_id);
-    unsigned vm_overhead = need_new_vm ? 8 : 0; // 8MB per new VM, 0 if reusing
+    unsigned vm_overhead = need_new_vm ? 8 : 0;
     unsigned total_needed = task_memory + vm_overhead;
     
     return (free_memory >= total_needed);
 }
 
-//testing
-// ==================== ADD THIS AT TOP (after globals) ====================
+double ComputeMinMinECT(MachineInfo_t info, TaskId_t task_id) {
+    unsigned expected_runtime = GetTaskInfo(task_id).target_completion;
+    double mips = (double)info.performance[0];
+    double load_factor = (double)info.active_tasks / (double)info.num_cpus;
+    double ect = (1.0 + load_factor) * (double)expected_runtime / (mips / 1000.0);
+
+    SLAType_t sla = RequiredSLA(task_id);
+    if(sla == SLA0)      ect *= 0.60;
+    else if(sla == SLA1) ect *= 0.80;
+
+    return ect;
+}
+
+void WakeMinMinMachines(CPUType_t req_cpu, bool wants_gpu) {
+    unsigned total = Machine_GetTotal();
+    unsigned pending_count = pending_tasks.size();
+
+    unsigned wake_budget = 1;
+    if(pending_count >= 1500) wake_budget = 4;
+    else if(pending_count >= 750) wake_budget = 3;
+    else if(pending_count >= 250) wake_budget = 2;
+
+    for(unsigned i = 0; i < total && wake_budget > 0; i++) {
+        MachineId_t machine = MachineId_t(i);
+        MachineInfo_t info  = Machine_GetInfo(machine);
+
+        if(info.cpu != req_cpu) continue;
+        if(wants_gpu && !info.gpus) continue;
+        if(machine_waking[machine]) continue;
+        if(info.s_state == S0) continue;
+
+        Machine_SetState(machine, S0);
+        machine_waking[machine] = true;
+        wake_budget--;
+
+        SimOutput("Scheduler::MINMIN: Waking machine " + to_string(machine), 2);
+    }
+}
+
+int ComputeEECOScore(MachineInfo_t info, bool task_wants_gpu) {
+    float util = (float)info.active_tasks / (float)info.num_cpus;
+    int score = (int)(util * 1000.0f);
+
+    if(info.active_tasks > 0) score += 500;
+    if(info.active_vms > 0) score += 100;
+    if(task_wants_gpu && info.gpus) score += 500;
+
+    return score;
+}
+
+// testing
 static Time_t last_print_time = 0;
 static const Time_t PRINT_INTERVAL = 10000000; // 10 seconds sim time
 
@@ -76,8 +122,6 @@ void PrintStatus(Time_t now) {
          << endl;
     cout.flush();
 }
-// ==================== END ADD ====================
-
 
 // The Scheduler!
 
@@ -97,7 +141,6 @@ void Scheduler::Init() {
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     PrintStatus(now);
 
-    // dont place a task that is already placed or pending
     if(task_placed[task_id]) return;
 
     VMType_t   required_vm  = RequiredVMType(task_id);
@@ -117,10 +160,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 continue;
             }
 
-            // never exceed the number of cores — this is the hard limit
             if(machine_info.active_tasks >= machine_info.num_cpus) continue;
 
-            VMId_t target_vm = VMId_t(-1); // find a VM for the current machine, if not make new one
+            VMId_t target_vm = VMId_t(-1);
             for(VMId_t vm : machine_vms[machine]) {
                 VMInfo_t vminfo = VM_GetInfo(vm);
                 if(vminfo.vm_type == required_vm && vminfo.cpu == required_cpu) {
@@ -134,13 +176,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 vms.push_back(target_vm);
                 machine_vms[machine].push_back(target_vm);
             }
-            // Add the current task to the VM, and update the round robin counter for the next task
             VM_AddTask(target_vm, task_id, priority);
             task_placed[task_id] = true;
             rr_counter = (idx + 1) % total;
             return;
         }
-        // No suitable machine found, queue the task for later
         SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
                   + to_string(task_id), 1);
         pending_tasks.push_back(task_id);
@@ -209,7 +249,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         MachineId_t best_machine = MachineId_t(-1);
         double best_ect          = 1e18;
         bool task_wants_gpu      = IsTaskGPUCapable(task_id);
-        unsigned expected_runtime = GetTaskInfo(task_id).target_completion;
 
         for(unsigned i = 0; i < total; i++) {
             MachineId_t machine = MachineId_t(i);
@@ -219,14 +258,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 || !MachineHasMemory(machine, task_id)) {
                 continue;
             }
-            if(info.active_tasks >= info.num_cpus) {
-                continue;
-            }
+            if(info.active_tasks >= info.num_cpus) continue;
             if(task_wants_gpu && !info.gpus) continue;
 
-            double mips        = (double)info.performance[0];
-            double load_factor = (double)info.active_tasks / (double)info.num_cpus;
-            double ect         = (1.0 + load_factor) * (double)expected_runtime / (mips / 1000.0);
+            double ect = ComputeMinMinECT(info, task_id);
 
             if(ect < best_ect) {
                 best_ect     = ect;
@@ -235,20 +270,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
 
         if(best_machine == MachineId_t(-1)) {
-            for(unsigned i = 0; i < total; i++) {
-                MachineId_t machine = MachineId_t(i);
-                MachineInfo_t info  = Machine_GetInfo(machine);
-                if(info.cpu != required_cpu) continue;
-                if(task_wants_gpu && !info.gpus) continue;
-                if(machine_waking[machine]) continue;
-                if(info.s_state != S0) {
-                    Machine_SetState(machine, S0);
-                    machine_waking[machine] = true;
-                    SimOutput("Scheduler::NewTask(MINMIN): Waking machine "
-                              + to_string(machine) + " for task " + to_string(task_id), 2);
-                    break;
-                }
-            }
+            WakeMinMinMachines(required_cpu, task_wants_gpu);
             SimOutput("Scheduler::NewTask(): No suitable machine found, queuing task "
                     + to_string(task_id), 1);
             pending_tasks.push_back(task_id);
@@ -279,7 +301,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         bool task_wants_gpu = IsTaskGPUCapable(task_id);
 
         MachineId_t best_machine = MachineId_t(-1);
-        unsigned best_score      = 0;
+        int best_score = -1;
 
         for(unsigned i = 0; i < total; i++) {
             MachineId_t machine = MachineId_t(i);
@@ -289,11 +311,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             if(info.cpu != required_cpu) continue;
             if(!MachineHasMemory(machine, task_id)) continue;
             if(info.active_tasks >= info.num_cpus) continue;
-
             if(task_wants_gpu && !info.gpus) continue;
 
-            unsigned score = info.active_tasks + 1;
-            if(task_wants_gpu && info.gpus) score += 500;
+            int score = ComputeEECOScore(info, task_wants_gpu);
+
             if(score > best_score) {
                 best_score   = score;
                 best_machine = machine;
@@ -306,7 +327,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 MachineInfo_t info  = Machine_GetInfo(machine);
                 if(info.cpu != required_cpu) continue;
                 if(task_wants_gpu && !info.gpus) continue;
-                if((info.s_state != S0) && !machine_waking[machine]) {
+                if(info.s_state != S0 && !machine_waking[machine]) {
                     Machine_SetState(machine, S0);
                     machine_waking[machine] = true;
                     SimOutput("Scheduler::NewTask(EECO): Waking machine "
@@ -345,9 +366,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         MachineInfo_t info = Machine_GetInfo(best_machine);
         float util = (float)(info.active_tasks + 1) / (float)info.num_cpus;
         CPUPerformance_t pstate;
-        if(util > 0.75f)       pstate = P0;
-        else if(util > 0.5f)   pstate = P1;
-        else if(util > 0.25f)  pstate = P2;
+        if(util > 0.90f)       pstate = P0;
+        else if(util > 0.65f)  pstate = P1;
+        else if(util > 0.35f)  pstate = P2;
         else                   pstate = P3;
         for(unsigned c = 0; c < info.num_cpus; c++)
             Machine_SetCorePerformance(best_machine, c, pstate);
@@ -358,7 +379,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 void Scheduler::PeriodicCheck(Time_t now) {
     PrintStatus(now);
 
-    // **CRITICAL**: Round Robin MUST drain pending tasks periodically
     if(CURRENT_ALGO == ROUND_ROBIN) {
         bool made_progress = true;
 
@@ -418,15 +438,19 @@ void Scheduler::PeriodicCheck(Time_t now) {
 
             pending_tasks = still_pending;
         }
-        return; // exit early for RR
+        return;
     }
 
-    // Only MINMIN and EECO use periodic check for sleep/wake management
     if(CURRENT_ALGO != MINMIN && CURRENT_ALGO != EECO) return;
 
     unsigned total = Machine_GetTotal();
 
-    // drain the pending queue using the appropriate algorithm
+    if(CURRENT_ALGO == MINMIN) {
+        sort(pending_tasks.begin(), pending_tasks.end(), [](TaskId_t a, TaskId_t b) {
+            return RequiredSLA(a) < RequiredSLA(b);
+        });
+    }
+
     vector<TaskId_t> still_pending;
     for(TaskId_t pending_id : pending_tasks) {
         if(task_placed[pending_id]) continue;
@@ -435,7 +459,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
         CPUType_t  req_cpu = RequiredCPUType(pending_id);
         Priority_t pri     = SLAToPriority(RequiredSLA(pending_id));
         bool wants_gpu     = IsTaskGPUCapable(pending_id);
-        unsigned exp_rt    = GetTaskInfo(pending_id).target_completion;
 
         MachineId_t best = MachineId_t(-1);
 
@@ -448,44 +471,30 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 if(!MachineHasMemory(machine, pending_id)) continue;
                 if(info.active_tasks >= info.num_cpus) continue;
                 if(wants_gpu && !info.gpus) continue;
-                double mips        = (double)info.performance[0];
-                double load_factor = (double)info.active_tasks / (double)info.num_cpus;
-                double ect         = (1.0 + load_factor) * (double)exp_rt / (mips / 1000.0);
+
+                double ect = ComputeMinMinECT(info, pending_id);
                 if(ect < best_ect) { best_ect = ect; best = machine; }
             }
-        } else { // EECO — consolidation based drain
-            unsigned best_score = 0;
+        } else {
+            int best_score = -1;
             for(unsigned i = 0; i < total; i++) {
                 MachineId_t machine = MachineId_t(i);
                 MachineInfo_t info  = Machine_GetInfo(machine);
-                if(info.s_state != S0 || info.cpu != req_cpu) continue;
+                if(info.s_state != S0) continue;
+                if(info.cpu != req_cpu) continue;
                 if(!MachineHasMemory(machine, pending_id)) continue;
                 if(info.active_tasks >= info.num_cpus) continue;
                 if(wants_gpu && !info.gpus) continue;
-                unsigned score = info.active_tasks + 1;
+
+                int score = ComputeEECOScore(info, wants_gpu);
+
                 if(score > best_score) { best_score = score; best = machine; }
             }
         }
 
         if(best == MachineId_t(-1)) {
             if(CURRENT_ALGO == MINMIN) {
-                for(unsigned i = 0; i < total; i++) {
-                    MachineId_t machine = MachineId_t(i);
-                    MachineInfo_t info  = Machine_GetInfo(machine);
-
-                    if(info.cpu != req_cpu) continue;
-                    if(wants_gpu && !info.gpus) continue;
-                    if(machine_waking[machine]) continue;
-
-                    if(info.s_state != S0) {
-                        Machine_SetState(machine, S0);
-                        machine_waking[machine] = true;
-                        SimOutput("Scheduler::PeriodicCheck(MINMIN): Waking machine "
-                                  + to_string(machine) + " for pending task "
-                                  + to_string(pending_id), 2);
-                        break;
-                    }
-                }
+                WakeMinMinMachines(req_cpu, wants_gpu);
             }
 
             if(CURRENT_ALGO == EECO) {
@@ -494,7 +503,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     MachineInfo_t info  = Machine_GetInfo(machine);
                     if(info.cpu != req_cpu) continue;
                     if(wants_gpu && !info.gpus) continue;
-                    if((info.s_state != S0) && !machine_waking[machine]) {
+                    if(info.s_state != S0 && !machine_waking[machine]) {
                         Machine_SetState(machine, S0);
                         machine_waking[machine] = true;
                         SimOutput("Scheduler::PeriodicCheck(EECO): Waking machine "
@@ -529,37 +538,16 @@ void Scheduler::PeriodicCheck(Time_t now) {
     }
     pending_tasks = still_pending;
 
-    // sleep idle machines to save energy (EECO only)
-    if(CURRENT_ALGO == EECO && pending_tasks.empty()) {
-        for(unsigned i = 0; i < total; i++) {
-            MachineId_t machine = MachineId_t(i);
-            MachineInfo_t info  = Machine_GetInfo(machine);
-            if(info.s_state != S0 || machine_waking[machine]) continue;
-            if(info.active_tasks > 0) continue;
-
-            bool has_work = false;
-            for(VMId_t vm : machine_vms[machine]) {
-                VMInfo_t vminfo = VM_GetInfo(vm);
-                if(!vminfo.active_tasks.empty()) { has_work = true; break; }
-            }
-
-            if(!has_work) {
-                SimOutput("Scheduler::PeriodicCheck(): Sleeping idle machine " + to_string(machine), 2);
-                Machine_SetState(machine, S5);
-            }
-        }
-    }
-
-    // EECO P-state tuning
+    // For EECO, keep P-state tuning but do NOT sleep machines here.
     if(CURRENT_ALGO == EECO) {
         for(unsigned i = 0; i < total; i++) {
             MachineId_t machine = MachineId_t(i);
             MachineInfo_t info  = Machine_GetInfo(machine);
             if(info.s_state != S0 || machine_waking[machine] || info.active_tasks == 0) continue;
             float util = (float)info.active_tasks / (float)info.num_cpus;
-            CPUPerformance_t pstate = (util > 0.75f) ? P0 :
-                                      (util > 0.5f)  ? P1 :
-                                      (util > 0.25f) ? P2 : P3;
+            CPUPerformance_t pstate = (util > 0.90f) ? P0 :
+                                      (util > 0.65f) ? P1 :
+                                      (util > 0.35f) ? P2 : P3;
             for(unsigned c = 0; c < info.num_cpus; c++)
                 Machine_SetCorePerformance(machine, c, pstate);
         }
